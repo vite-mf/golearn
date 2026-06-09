@@ -20,20 +20,22 @@ type Handler[T any] func(ctx context.Context, msg T) error
 
 // Queue is a bounded MPMC queue with worker pool consumption.
 type Queue[T any] struct {
-	slots chan struct{}
+	// bufferVacancies is a buffered channel counting free logical buffer slots:
+	// receive one token before enqueueing; send one back after dequeue.
+	bufferVacancies chan struct{}
 
-	mu sync.Mutex
-	cv *sync.Cond
+	queueMu   sync.Mutex
+	queueCond *sync.Cond // wake workers on new message, slot freed, or close
 
-	msgs []T
-	h    Handler[T]
+	pendingMessages []T
+	handler         Handler[T]
 
-	closed bool
+	isClosed bool
 
-	stopCtx    context.Context
-	stopCancel context.CancelFunc
+	shutdownCtx    context.Context // passed to Handler; canceled on Close
+	shutdownCancel context.CancelFunc
 
-	wg sync.WaitGroup
+	workerWaitGroup sync.WaitGroup
 }
 
 // New creates a queue with workerCount consumers and a buffer of buf messages.
@@ -44,97 +46,97 @@ func New[T any](workerCount, buf int, h Handler[T]) *Queue[T] {
 	if buf < 1 {
 		buf = 1
 	}
-	stopCtx, stopCancel := context.WithCancel(context.Background())
-	slots := make(chan struct{}, buf)
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	bufferVacancies := make(chan struct{}, buf)
 	for range buf {
-		slots <- struct{}{}
+		bufferVacancies <- struct{}{}
 	}
 	q := &Queue[T]{
-		slots:      slots,
-		h:          h,
-		stopCtx:    stopCtx,
-		stopCancel: stopCancel,
+		bufferVacancies: bufferVacancies,
+		handler:         h,
+		shutdownCtx:     shutdownCtx,
+		shutdownCancel:  shutdownCancel,
 	}
-	q.cv = sync.NewCond(&q.mu)
+	q.queueCond = sync.NewCond(&q.queueMu)
 	for range workerCount {
-		q.wg.Add(1)
+		q.workerWaitGroup.Add(1)
 		go q.worker()
 	}
 	return q
 }
 
 func (q *Queue[T]) worker() {
-	defer q.wg.Done()
+	defer q.workerWaitGroup.Done()
 	for {
 		msg, ok := q.dequeue()
 		if !ok {
 			return
 		}
-		_ = q.h(q.stopCtx, msg)
+		_ = q.handler(q.shutdownCtx, msg)
 	}
 }
 
 func (q *Queue[T]) dequeue() (T, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.queueMu.Lock()
+	defer q.queueMu.Unlock()
 	var zero T
-	for len(q.msgs) == 0 && !q.closed {
-		q.cv.Wait()
+	for len(q.pendingMessages) == 0 && !q.isClosed {
+		q.queueCond.Wait()
 	}
-	if len(q.msgs) == 0 {
+	if len(q.pendingMessages) == 0 {
 		return zero, false
 	}
-	msg := q.msgs[0]
-	copy(q.msgs, q.msgs[1:])
-	q.msgs = q.msgs[:len(q.msgs)-1]
+	msg := q.pendingMessages[0]
+	copy(q.pendingMessages, q.pendingMessages[1:])
+	q.pendingMessages = q.pendingMessages[:len(q.pendingMessages)-1]
 
-	q.slots <- struct{}{}
-	q.cv.Broadcast()
+	q.bufferVacancies <- struct{}{}
+	q.queueCond.Broadcast()
 	return msg, true
 }
 
 // Publish delivers msg to the pool. waitCtx bounds waiting for buffer space.
 func (q *Queue[T]) Publish(waitCtx context.Context, msg T) error {
 	select {
-	case <-q.slots:
-	case <-q.stopCtx.Done():
+	case <-q.bufferVacancies:
+	case <-q.shutdownCtx.Done():
 		return ErrClosed
 	case <-waitCtx.Done():
 		return waitCtx.Err()
 	}
 
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
+	q.queueMu.Lock()
+	if q.isClosed {
+		q.queueMu.Unlock()
 		select {
-		case q.slots <- struct{}{}:
+		case q.bufferVacancies <- struct{}{}:
 		default:
 		}
 		return ErrClosed
 	}
-	q.msgs = append(q.msgs, msg)
-	q.cv.Broadcast()
-	q.mu.Unlock()
+	q.pendingMessages = append(q.pendingMessages, msg)
+	q.queueCond.Broadcast()
+	q.queueMu.Unlock()
 	return nil
 }
 
 // Close cancels the handler context, marks the queue closed, drains pending
 // messages, and waits for workers to exit. ctx bounds the wait.
 func (q *Queue[T]) Close(ctx context.Context) error {
-	q.stopCancel()
+	q.shutdownCancel()
 
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
+	q.queueMu.Lock()
+	if q.isClosed {
+		q.queueMu.Unlock()
 		return nil
 	}
-	q.closed = true
-	q.cv.Broadcast()
-	q.mu.Unlock()
+	q.isClosed = true
+	q.queueCond.Broadcast()
+	q.queueMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
-		q.wg.Wait()
+		q.workerWaitGroup.Wait()
 		close(done)
 	}()
 	select {

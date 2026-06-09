@@ -2,9 +2,9 @@
 
 Bounded in-memory message queue combining **producer–consumer** flow with a **worker pool**:
 
-- Producers acquire a slot from a token channel, then append under `sync.Mutex` and `sync.Cond` broadcast wakes workers.
-- Workers dequeue messages, return the slot token, and invoke the shared `Handler`.
-- `Close` cancels `stopCtx` passed to handlers, marks the queue closed, broadcasts, and waits on `sync.WaitGroup`.
+- Producers take a token from `bufferVacancies`, then append under `queueMu`; `queueCond.Broadcast` wakes workers.
+- Workers dequeue from `pendingMessages`, return a vacancy token, and invoke `handler` with `shutdownCtx`.
+- `Close` cancels `shutdownCtx` passed to handlers, sets `isClosed`, broadcasts, and waits on `workerWaitGroup`.
 
 ## Usage
 

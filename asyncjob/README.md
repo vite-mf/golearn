@@ -3,9 +3,9 @@
 In-memory asynchronous job manager demonstrating native Go concurrency:
 
 - **Worker pool**: goroutines block on `sync.Cond` until jobs are available.
-- **Bounded queue**: a buffered **token channel** (`slots`) couples with a mutex-backed slice so producers wait for capacity without racing `close` on the work channel.
-- **Primitives**: `sync.Mutex`, `sync.Cond`, `sync.WaitGroup`, `context.Context`, and channels.
-- **Shutdown**: cancels execution and stop contexts, marks stopped, broadcasts waiters, then waits for workers to drain the queue.
+- **Bounded queue**: buffered **`bufferVacancies`** (semaphore) plus mutex-backed **`jobQueue`** so producers wait for capacity without racing `close` on a work channel.
+- **Primitives**: `queueMu`, `queueCond`, `workerWaitGroup`, `submitShutdownCtx` / `jobExecutionCtx`, and channels.
+- **Shutdown**: cancels **`jobExecutionCtx`** then **`submitShutdownCtx`**, sets **`isShutdown`**, broadcasts, then waits on **`workerWaitGroup`** until the queue drains.
 
 ## Usage
 

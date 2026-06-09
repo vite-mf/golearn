@@ -20,21 +20,23 @@ type JobFunc func(ctx context.Context) error
 
 // Manager queues jobs in memory and executes them on a fixed-size worker pool.
 type Manager struct {
-	slots chan struct{} // tokens: available capacity in the queue
+	// bufferVacancies counts free logical queue slots (semaphore as channel).
+	bufferVacancies chan struct{}
 
-	mu  sync.Mutex
-	cv  *sync.Cond
-	q   []func()
-	cap int
+	queueMu   sync.Mutex
+	queueCond *sync.Cond // wake workers on new job, slot freed, or shutdown
+	jobQueue  []func()
 
-	stopped bool
+	isShutdown bool
 
-	stopCtx    context.Context
-	stopCancel context.CancelFunc
-	execCtx    context.Context
-	execCancel context.CancelFunc 
+	// submitShutdownCtx is canceled during Shutdown so Submit unblocks waiting for a slot.
+	submitShutdownCtx    context.Context
+	submitShutdownCancel context.CancelFunc
+	// jobExecutionCtx is passed into each JobFunc; canceled first in Shutdown.
+	jobExecutionCtx    context.Context
+	jobExecutionCancel context.CancelFunc
 
-	wg sync.WaitGroup
+	workerWaitGroup sync.WaitGroup
 }
 
 // NewManager starts workerCount goroutines and a bounded queue of queueSize jobs.
@@ -45,32 +47,31 @@ func NewManager(workerCount, queueSize int) *Manager {
 	if queueSize < 1 {
 		queueSize = 1
 	}
-	stopCtx, stopCancel := context.WithCancel(context.Background())
-	execCtx, execCancel := context.WithCancel(context.Background())
+	submitShutdownCtx, submitShutdownCancel := context.WithCancel(context.Background())
+	jobExecutionCtx, jobExecutionCancel := context.WithCancel(context.Background())
 
-	slots := make(chan struct{}, queueSize)
+	bufferVacancies := make(chan struct{}, queueSize)
 	for range queueSize {
-		slots <- struct{}{}
+		bufferVacancies <- struct{}{}
 	}
 
 	m := &Manager{
-		slots:      slots,
-		cap:        queueSize,
-		stopCtx:    stopCtx,
-		stopCancel: stopCancel,
-		execCtx:    execCtx,
-		execCancel: execCancel,
+		bufferVacancies:      bufferVacancies,
+		submitShutdownCtx:    submitShutdownCtx,
+		submitShutdownCancel: submitShutdownCancel,
+		jobExecutionCtx:      jobExecutionCtx,
+		jobExecutionCancel:   jobExecutionCancel,
 	}
-	m.cv = sync.NewCond(&m.mu)
+	m.queueCond = sync.NewCond(&m.queueMu)
 	for range workerCount {
-		m.wg.Add(1)
+		m.workerWaitGroup.Add(1)
 		go m.worker()
 	}
 	return m
 }
 
 func (m *Manager) worker() {
-	defer m.wg.Done()
+	defer m.workerWaitGroup.Done()
 	for {
 		job := m.dequeue()
 		if job == nil {
@@ -81,20 +82,20 @@ func (m *Manager) worker() {
 }
 
 func (m *Manager) dequeue() func() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for len(m.q) == 0 && !m.stopped {
-		m.cv.Wait()
+	m.queueMu.Lock()
+	defer m.queueMu.Unlock()
+	for len(m.jobQueue) == 0 && !m.isShutdown {
+		m.queueCond.Wait()
 	}
-	if len(m.q) == 0 {
+	if len(m.jobQueue) == 0 {
 		return nil
 	}
-	fn := m.q[0]
-	copy(m.q, m.q[1:])
-	m.q = m.q[:len(m.q)-1]
+	fn := m.jobQueue[0]
+	copy(m.jobQueue, m.jobQueue[1:])
+	m.jobQueue = m.jobQueue[:len(m.jobQueue)-1]
 
-	m.slots <- struct{}{}
-	m.cv.Broadcast()
+	m.bufferVacancies <- struct{}{}
+	m.queueCond.Broadcast()
 	return fn
 }
 
@@ -105,48 +106,48 @@ func (m *Manager) Submit(waitCtx context.Context, job JobFunc) error {
 		return errors.New("asyncjob: nil job")
 	}
 	select {
-	case <-m.slots:
-	case <-m.stopCtx.Done():
+	case <-m.bufferVacancies:
+	case <-m.submitShutdownCtx.Done():
 		return ErrStopped
 	case <-waitCtx.Done():
 		return waitCtx.Err()
 	}
 
-	wrapped := func() { _ = job(m.execCtx) }
+	runJob := func() { _ = job(m.jobExecutionCtx) }
 
-	m.mu.Lock()
-	if m.stopped {
-		m.mu.Unlock()
+	m.queueMu.Lock()
+	if m.isShutdown {
+		m.queueMu.Unlock()
 		select {
-		case m.slots <- struct{}{}:
+		case m.bufferVacancies <- struct{}{}:
 		default:
 		}
 		return ErrStopped
 	}
-	m.q = append(m.q, wrapped)
-	m.cv.Broadcast()
-	m.mu.Unlock()
+	m.jobQueue = append(m.jobQueue, runJob)
+	m.queueCond.Broadcast()
+	m.queueMu.Unlock()
 	return nil
 }
 
 // Shutdown cancels contexts, marks the manager stopped, wakes workers, and
 // waits until the queue is drained and workers exit. ctx bounds the wait.
 func (m *Manager) Shutdown(ctx context.Context) error {
-	m.execCancel()
-	m.stopCancel()
+	m.jobExecutionCancel()
+	m.submitShutdownCancel()
 
-	m.mu.Lock()
-	if m.stopped {
-		m.mu.Unlock()
+	m.queueMu.Lock()
+	if m.isShutdown {
+		m.queueMu.Unlock()
 		return nil
 	}
-	m.stopped = true
-	m.cv.Broadcast()
-	m.mu.Unlock()
+	m.isShutdown = true
+	m.queueCond.Broadcast()
+	m.queueMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
-		m.wg.Wait()
+		m.workerWaitGroup.Wait()
 		close(done)
 	}()
 	select {
