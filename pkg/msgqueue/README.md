@@ -9,6 +9,8 @@ Bounded in-memory message queue combining **producer–consumer** flow with a **
 ## Usage
 
 ```go
+import "golearn/pkg/msgqueue"
+
 var sum atomic.Int64
 q := msgqueue.New(8, 1024, func(ctx context.Context, n int) error {
 	sum.Add(int64(n))

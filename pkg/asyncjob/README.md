@@ -10,6 +10,8 @@ In-memory asynchronous job manager demonstrating native Go concurrency:
 ## Usage
 
 ```go
+import "golearn/pkg/asyncjob"
+
 m := asyncjob.NewManager(4, 64)
 defer func() { _ = m.Shutdown(context.Background()) }()
 
