@@ -47,10 +47,15 @@ func NewManager(workerCount, queueSize int) *Manager {
 	if queueSize < 1 {
 		queueSize = 1
 	}
+	// Initialize shutdown context
+	// Initialize job execution context
 	submitShutdownCtx, submitShutdownCancel := context.WithCancel(context.Background())
 	jobExecutionCtx, jobExecutionCancel := context.WithCancel(context.Background())
 
+	// Initialize buffer vacancies
+	// Backpressure mechanism
 	bufferVacancies := make(chan struct{}, queueSize)
+	// Fill buffer vacancies
 	for range queueSize {
 		bufferVacancies <- struct{}{}
 	}
@@ -62,9 +67,12 @@ func NewManager(workerCount, queueSize int) *Manager {
 		jobExecutionCtx:      jobExecutionCtx,
 		jobExecutionCancel:   jobExecutionCancel,
 	}
+	// Initialize queue condition
 	m.queueCond = sync.NewCond(&m.queueMu)
 	for range workerCount {
+		// Add 1 to worker wait group
 		m.workerWaitGroup.Add(1)
+		// Goroutine to handle jobs
 		go m.worker()
 	}
 	return m
@@ -91,7 +99,9 @@ func (m *Manager) dequeue() func() {
 		return nil
 	}
 	fn := m.jobQueue[0]
+	// Shiftleft
 	copy(m.jobQueue, m.jobQueue[1:])
+	// Remove last element
 	m.jobQueue = m.jobQueue[:len(m.jobQueue)-1]
 
 	m.bufferVacancies <- struct{}{}
@@ -133,7 +143,9 @@ func (m *Manager) Submit(waitCtx context.Context, job JobFunc) error {
 // Shutdown cancels contexts, marks the manager stopped, wakes workers, and
 // waits until the queue is drained and workers exit. ctx bounds the wait.
 func (m *Manager) Shutdown(ctx context.Context) error {
+	// Cancel job execution context
 	m.jobExecutionCancel()
+	// Cancel submit shutdown context
 	m.submitShutdownCancel()
 
 	m.queueMu.Lock()
